@@ -1,0 +1,271 @@
+pipeline {
+    agent none
+
+    environment {
+        GRADLE_OPTS = '-Dorg.gradle.daemon=false -Dfile.encoding=UTF-8 -Xmx2048m'
+    }
+
+    options {
+        timeout(time: 4, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds()
+        timestamps()
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Quality gates') {
+            agent {
+                label '<ANDROID_BUILD_AGENT_LABEL>'
+            }
+
+            stages {
+                stage('Checkout') {
+                    steps {
+                        checkout scm
+                    }
+                }
+
+                stage('Unit tests') {
+                    steps {
+                        bat 'gradlew.bat <UNIT_TEST_TASKS> --continue --console=plain --no-daemon'
+                    }
+
+                    post {
+                        always {
+                            junit(
+                                allowEmptyResults: true,
+                                testResults: '**/build/test-results/**/*.xml'
+                            )
+                        }
+                    }
+                }
+
+                stage('Lint') {
+                    steps {
+                        bat 'gradlew.bat <LINT_TASKS> --continue --console=plain --no-daemon'
+                    }
+
+                    post {
+                        always {
+                            archiveArtifacts(
+                                allowEmptyArchive: true,
+                                artifacts: '**/build/reports/lint-results-*.*'
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Instrumented tests') {
+            when {
+                expression { return false } // Enable when this project has emulator coverage configured.
+            }
+
+            matrix {
+                axes {
+                    axis {
+                        name 'ANDROID_API'
+                        values '<API_LEVEL_1>', '<API_LEVEL_2>'
+                    }
+                }
+
+                agent {
+                    label '<ANDROID_EMULATOR_AGENT_LABEL>'
+                }
+
+                options {
+                    timeout(time: 2, unit: 'HOURS')
+                }
+
+                stages {
+                    stage('Run on emulator') {
+                        steps {
+                            checkout scm
+
+                            script {
+                                def emulatorPorts = [
+                                    '<API_LEVEL_1>': '<EMULATOR_PORT_1>',
+                                    '<API_LEVEL_2>': '<EMULATOR_PORT_2>'
+                                ]
+
+                                withEnv([
+                                    "ANDROID_AVD=<AVD_NAME_PREFIX>${env.ANDROID_API}",
+                                    "ANDROID_EMULATOR_PORT=${emulatorPorts[env.ANDROID_API]}"
+                                ]) {
+                                    bat 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <INSTRUMENTED_TEST_SCRIPT_PATH>'
+                                }
+                            }
+                        }
+
+                        post {
+                            always {
+                                junit(
+                                    allowEmptyResults: true,
+                                    testResults: '**/build/outputs/androidTest-results/connected/**/*.xml'
+                                )
+
+                                archiveArtifacts(
+                                    allowEmptyArchive: true,
+                                    artifacts: '**/build/reports/androidTests/connected/**'
+                                )
+
+                                cleanWs()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build distributables') {
+            agent {
+                label '<ANDROID_BUILD_AGENT_LABEL>'
+            }
+
+            stages {
+                stage('Checkout') {
+                    steps {
+                        checkout scm
+                    }
+                }
+
+                stage('Build debug APK') {
+                    when {
+                        changeRequest()
+                    }
+
+                    steps {
+                        bat 'gradlew.bat <DEBUG_BUILD_TASKS> --console=plain --no-daemon'
+                    }
+
+                    post {
+                        success {
+                            archiveArtifacts(
+                                allowEmptyArchive: true,
+                                artifacts: '**/build/outputs/apk/debug/*.apk',
+                                fingerprint: true
+                            )
+                        }
+                    }
+                }
+
+                stage('Build release artifacts') {
+                    when {
+                        branch '<RELEASE_BRANCH>'
+                    }
+
+                    steps {
+                        withCredentials([
+                            file(credentialsId: '<RELEASE_KEYSTORE_CREDENTIAL_ID>', variable: 'RELEASE_STORE_FILE'),
+                            string(credentialsId: '<RELEASE_STORE_PASSWORD_CREDENTIAL_ID>', variable: 'RELEASE_STORE_PASSWORD'),
+                            string(credentialsId: '<RELEASE_KEY_ALIAS_CREDENTIAL_ID>', variable: 'RELEASE_KEY_ALIAS'),
+                            string(credentialsId: '<RELEASE_KEY_PASSWORD_CREDENTIAL_ID>', variable: 'RELEASE_KEY_PASSWORD')
+                        ]) {
+                            bat 'gradlew.bat <RELEASE_BUILD_TASKS> --console=plain --no-daemon'
+                        }
+                    }
+
+                    post {
+                        success {
+                            archiveArtifacts(
+                                allowEmptyArchive: true,
+                                artifacts: '**/build/outputs/apk/release/*.apk,**/build/outputs/bundle/release/*.aab,**/build/outputs/mapping/release/mapping.txt',
+                                fingerprint: true
+                            )
+                        }
+                    }
+                }
+
+                stage('Distribute debug build') {
+                    when {
+                        expression { return false } // Optional: enable for PR/dev distribution.
+                    }
+
+                    steps {
+                        withCredentials([
+                            file(credentialsId: '<DISTRIBUTION_SERVICE_ACCOUNT_CREDENTIAL_ID>', variable: 'GOOGLE_APPLICATION_CREDENTIALS'),
+                            string(credentialsId: '<DEBUG_DISTRIBUTION_APP_ID_CREDENTIAL_ID>', variable: 'DISTRIBUTION_APP_ID')
+                        ]) {
+                            powershell '''
+                                $artifact = Get-ChildItem `
+                                    -Path "<DEBUG_ARTIFACT_GLOB>" `
+                                    -File |
+                                    Select-Object -First 1
+
+                                if (-not $artifact) {
+                                    throw "No debug artifact found."
+                                }
+
+                                <DISTRIBUTION_COMMAND> "$($artifact.FullName)" `
+                                    --app "$env:DISTRIBUTION_APP_ID" `
+                                    --groups "<DISTRIBUTION_GROUPS>" `
+                                    --release-notes "PR #$env:CHANGE_ID ($env:CHANGE_BRANCH) - build $env:BUILD_NUMBER - $env:GIT_COMMIT"
+
+                                if ($LASTEXITCODE -ne 0) {
+                                    exit $LASTEXITCODE
+                                }
+                            '''
+                        }
+                    }
+                }
+
+                stage('Distribute release build') {
+                    when {
+                        expression { return false } // Optional: enable for release distribution.
+                    }
+
+                    steps {
+                        withCredentials([
+                            file(credentialsId: '<DISTRIBUTION_SERVICE_ACCOUNT_CREDENTIAL_ID>', variable: 'GOOGLE_APPLICATION_CREDENTIALS'),
+                            string(credentialsId: '<RELEASE_DISTRIBUTION_APP_ID_CREDENTIAL_ID>', variable: 'DISTRIBUTION_APP_ID')
+                        ]) {
+                            powershell '''
+                                $artifact = Get-ChildItem `
+                                    -Path "<RELEASE_ARTIFACT_GLOB>" `
+                                    -File |
+                                    Select-Object -First 1
+
+                                if (-not $artifact) {
+                                    throw "No release artifact found."
+                                }
+
+                                <DISTRIBUTION_COMMAND> "$($artifact.FullName)" `
+                                    --app "$env:DISTRIBUTION_APP_ID" `
+                                    --groups "<DISTRIBUTION_GROUPS>" `
+                                    --release-notes "Release build $env:BUILD_NUMBER - $env:GIT_COMMIT"
+
+                                if ($LASTEXITCODE -ne 0) {
+                                    exit $LASTEXITCODE
+                                }
+                            '''
+                        }
+                    }
+                }
+            }
+
+            post {
+                always {
+                    cleanWs()
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Optional: replace or remove if your Jenkins instance does not publish SCM commit status.
+            step([
+                $class: 'GitHubCommitStatusSetter',
+                contextSource: [
+                    $class: 'ManuallyEnteredCommitContextSource',
+                    context: 'ci/jenkins/android'
+                ],
+                statusResultSource: [
+                    $class: 'DefaultStatusResultSource'
+                ]
+            ])
+        }
+    }
+}
