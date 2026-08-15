@@ -1,0 +1,155 @@
+name: AI Candidate Agent
+
+on:
+  issues:
+    types: [labeled]
+
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# Replace the placeholders below as appropriate for each repository.
+#
+# Required replacements:
+#   YOUR_GITHUB_USERNAME
+#   YOUR_PROJECT_RUNNER_LABEL
+#
+# Optional configuration:
+#   JAVA_VERSION
+#   OPENCODE_MODEL
+#   MAX_AGENT_VALIDATION_ATTEMPTS
+#   AI_CANDIDATE_LABEL
+# ---------------------------------------------------------------------------
+
+concurrency:
+  group: ai-candidate-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    if: >
+      github.event.label.name == 'AI-Candidate' &&
+      github.actor == 'YOUR_GITHUB_USERNAME' &&
+      github.event.issue.state == 'open'
+
+    runs-on:
+      [
+        self-hosted,
+        Windows,
+        X64,
+        YOUR_PROJECT_RUNNER_LABEL,
+        ai-candidate
+      ]
+
+    timeout-minutes: 360
+
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    env:
+      # GitHub context
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      ACTIONS_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # Agent configuration
+      OPENCODE_MODEL: opencode/deepseek-v4-flash-free
+      MAX_AGENT_VALIDATION_ATTEMPTS: "5"
+
+      # OpenCode configuration
+      OPENCODE_DISABLE_AUTOUPDATE: "true"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Copy the orchestrator outside the checked-out repository before allowing
+      # the agent to modify the working tree. Subsequent phases execute this
+      # trusted copy rather than a potentially modified repository script.
+      - name: Stage trusted orchestrator
+        shell: pwsh
+        run: |
+          Copy-Item `
+            -LiteralPath .github/scripts/Invoke-AiCandidate.ps1 `
+            -Destination "${{ runner.temp }}/ai-candidate-${{ github.run_id }}-${{ github.run_attempt }}.ps1" `
+            -Force
+
+      - name: Validate tools, issue, and model
+        shell: pwsh
+        run: >
+          pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File "${{ runner.temp }}/ai-candidate-${{ github.run_id }}-${{ github.run_attempt }}.ps1"
+          -Phase Preflight
+
+      - name: Prepare clean issue branch
+        shell: pwsh
+        run: >
+          pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File "${{ runner.temp }}/ai-candidate-${{ github.run_id }}-${{ github.run_attempt }}.ps1"
+          -Phase Prepare
+
+      - name: Run agent and validate changes
+        if: env.SKIP_AGENT != 'true'
+        shell: pwsh
+        run: >
+          pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File "${{ runner.temp }}/ai-candidate-${{ github.run_id }}-${{ github.run_attempt }}.ps1"
+          -Phase Implement
+
+      - name: Commit changes and publish draft pull request
+        if: env.SKIP_AGENT != 'true'
+        shell: pwsh
+        run: >
+          pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File "${{ runner.temp }}/ai-candidate-${{ github.run_id }}-${{ github.run_attempt }}.ps1"
+          -Phase Publish
+
+      - name: Update issue after publication
+        shell: pwsh
+        run: >
+          pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File "${{ runner.temp }}/ai-candidate-${{ github.run_id }}-${{ github.run_attempt }}.ps1"
+          -Phase Finalize
+
+      - name: Report failure and make issue retryable
+        if: failure()
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File "${{ runner.temp }}/ai-candidate-${{ github.run_id }}-${{ github.run_attempt }}.ps1"
+          -Phase ReportFailure
+
+      - name: Clean persistent runner workspace
+        if: always()
+        continue-on-error: true
+        env:
+          JOB_STATUS: ${{ job.status }}
+        shell: pwsh
+        run: >
+          pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File "${{ runner.temp }}/ai-candidate-${{ github.run_id }}-${{ github.run_attempt }}.ps1"
+          -Phase Cleanup
+
+      - name: Remove trusted orchestrator
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          Remove-Item
+          -LiteralPath "${{ runner.temp }}/ai-candidate-${{ github.run_id }}-${{ github.run_attempt }}.ps1"
+          -Force
+          -ErrorAction SilentlyContinue
