@@ -1,0 +1,119 @@
+name: Prefix issue titles
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+# ---------------------------------------------------------------------------
+# Project configuration
+#
+# Change ISSUE_PREFIX for each repository.
+#
+# Example:
+#   ISSUE_PREFIX: "MY-PROJECT"
+#
+# Generated issue titles will look like:
+#   MY-PROJECT-123: Original issue title
+# ---------------------------------------------------------------------------
+env:
+  ISSUE_PREFIX: "YOUR-PROJECT-PREFIX"
+
+concurrency:
+  # A run reconciles every open, unprefixed issue. This makes replacing an older
+  # pending run safe when several issues are opened in quick succession.
+  group: prefix-issue-titles-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prefix-title:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Add next issue key
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          highest_issue_number=0
+
+          # Escape the configured prefix so characters with special regex
+          # meanings are treated literally.
+          escaped_prefix="$(
+            printf '%s' "$ISSUE_PREFIX" |
+              sed 's/[][(){}.^$*+?|\\/]/\\&/g'
+          )"
+
+          # Commit order is not ticket order, so inspect every matching subject.
+          #
+          # Expected format:
+          #   PROJECT-123: Commit subject
+          while IFS= read -r issue_key_number; do
+            if (( 10#$issue_key_number > highest_issue_number )); then
+              highest_issue_number=$((10#$issue_key_number))
+            fi
+          done < <(
+            git log --all --format='%s' |
+              sed -nE "s/^${escaped_prefix}-([0-9]+):.*/\1/p"
+          )
+
+          # Include both open and closed issues when finding the allocated maximum.
+          # Pull requests are returned by this endpoint too, so exclude them.
+          mapfile -t issue_records < <(
+            gh api --paginate \
+              "repos/${GH_REPO}/issues?state=all&sort=created&direction=asc&per_page=100" \
+              --jq '.[] | select(has("pull_request") | not) | {number, title, state} | @base64'
+          )
+
+          for encoded_issue in "${issue_records[@]}"; do
+            issue_title="$(
+              base64 --decode <<< "$encoded_issue" |
+                jq -r '.title'
+            )"
+
+            if [[ "$issue_title" =~ ^${ISSUE_PREFIX}-([0-9]+): ]]; then
+              issue_key_number="${BASH_REMATCH[1]}"
+
+              if (( 10#$issue_key_number > highest_issue_number )); then
+                highest_issue_number=$((10#$issue_key_number))
+              fi
+            fi
+          done
+
+          echo "Highest allocated issue key: ${ISSUE_PREFIX}-${highest_issue_number}"
+
+          # Process every open issue still awaiting a prefix.
+          #
+          # Serialized runs plus this reconciliation avoid duplicate keys when
+          # several issues are opened in quick succession.
+          for encoded_issue in "${issue_records[@]}"; do
+            issue_json="$(base64 --decode <<< "$encoded_issue")"
+            issue_number="$(jq -r '.number' <<< "$issue_json")"
+            issue_title="$(jq -r '.title' <<< "$issue_json")"
+            issue_state="$(jq -r '.state' <<< "$issue_json")"
+
+            if [[ "$issue_state" != "open" ]] ||
+              [[ "$issue_title" =~ ^${ISSUE_PREFIX}-[0-9]+: ]]; then
+              continue
+            fi
+
+            highest_issue_number=$((highest_issue_number + 1))
+            new_title="${ISSUE_PREFIX}-${highest_issue_number}: ${issue_title}"
+
+            echo "Renaming GitHub issue #${issue_number} to: ${new_title}"
+
+            gh issue edit "$issue_number" \
+              --repo "$GH_REPO" \
+              --title "$new_title"
+          done
